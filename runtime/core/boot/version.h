@@ -51,6 +51,11 @@ typedef struct {
                                        // the v register of the replaced fmul's second operand
     uint64_t pane_matrix_fn;   // nn::ui2d's pane global-matrix builder (pane, draw info) (set aspect, host_pane_matrix);
                                // 0: its callers are not in the version's table
+    // set display (1.8.0): the display's requested size (w | h << 32 at [display + 0x10 + 8 * slot]), which the render
+    // targets and the window crop follow: its store in the per-mode update (value and base registers) and its setter
+    // (display, const size *, slot); 0 where the version has none (1.0.0 scales its picture to the whole output)
+    uint64_t display_store, display_set_fn;
+    uint8_t display_value_reg, display_base_reg;
     RtRaceEvent race_events[RT_RACE_EVENTS];   // race_scene.c; none: 20 and 15 fps apply everywhere
     // sdk offsets: the NVN2 driver's proc table (tools/gpu/nvn2_procs.py TABLES, the same rows)
     uint64_t sdk_name_pool, sdk_name_offsets, sdk_pointers;

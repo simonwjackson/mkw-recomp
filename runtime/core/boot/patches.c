@@ -37,6 +37,8 @@
 #define UI_ROWS2_HOST 0xf40      // patch page offset of host_ui_rows2 (set aspect, 1.8.0)
 #define FX_VIEW_HOST 0xf20       // patch page offset of host_fx_view (set aspect)
 #define PANE_MATRIX_HOST 0xdf0   // patch page offset of host_pane_matrix (set aspect, 1.8.0), below race_scene.c's
+#define DISPLAY_SIZE_HOST 0xf10  // patch page offset of host_display_size (set display, 1.8.0)
+#define DISPLAY_SET_HOST 0xf00   // patch page offset of host_display_set (set display, 1.8.0)
                                  // 0xe00-0xef0: race_scene.c, one per node (RT_RACE_HOST)
 // The guest functions the sets call or recognise, per game version (version.h; 1.0.0: main+0x233358 RenderBuffer
 // creation, main+0x8eb6b0 the render-buffer allocator setup that main+0x37b520 allocates from, main+0x67aa40 operator
@@ -243,6 +245,54 @@ static void host_camera_fov(Cpu *c) {
     half *= angle;
     c->v[8] = 0;
     memcpy(&c->v[8], &half, sizeof half);
+}
+
+// The output the game made (output_size): 1.8.0's window textures, which the display size must fit (display_fit)
+static uint32_t output_wh[2];
+
+// A 16:9 display size fitted to the output's aspect (set display, 1.8.0): on a taller output the same width and the
+// rows of its aspect, on a wider one the same rows and the columns of its aspect (both even), as aspect_tall_target
+// adds rows instead of removing columns. Other sizes, and a 16:9 output, keep theirs. 1.8.0 crops its picture from
+// the window textures, the output's size: a size that does not fit them is shrunk to fit, with its shape (at 32:9 a
+// 5120x1440 size in 3840x2160 textures came out with its outer 640 columns black on each side).
+static uint64_t display_fit(uint64_t wh) {
+    uint32_t w = (uint32_t)wh, h = (uint32_t)(wh >> 32);
+    if (!(aspect_scale > 0) || aspect_scale == 1 || !w || !h || fabsf((float)w / (float)h - 16.0f / 9) > 0.01f)
+        return wh;
+    float fw = (float)w, fh = (float)h;
+    if (aspect_scale > 1) fw = fh * aspect_out;
+    else fh = fw / aspect_out;
+    float fit = 1;
+    if (output_wh[0] && output_wh[1]) fit = fminf(1.0f, fminf((float)output_wh[0] / fw, (float)output_wh[1] / fh));
+    uint32_t nw = ((uint32_t)(fw * fit + 0.5f) + 1) & ~1u, nh = ((uint32_t)(fh * fit + 0.5f) + 1) & ~1u;
+    return nw | (uint64_t)nh << 32;
+}
+
+static void display_note(uint64_t wh, uint64_t fitted) {
+    static int logged;
+    if (fitted != wh && !logged++)
+        rt_log("patches: display %ux%u made %ux%u (MKW_ASPECT, output %ux%u)", (unsigned)wh, (unsigned)(wh >> 32),
+               (unsigned)fitted, (unsigned)(fitted >> 32), output_wh[0], output_wh[1]);
+}
+
+// In place of 1.8.0's store of the display's requested size in its per-mode update (version.c display_store): the
+// same store, of the fitted size. The registers keep the original size, so the mode index the game derives from it
+// right after is unchanged.
+static void host_display_size(Cpu *c) {
+    const RtVersion *v = rt_version();
+    uint64_t wh = c->x[v->display_value_reg], fitted = display_fit(wh);
+    *(uint64_t *)(uintptr_t)(c->x[v->display_base_reg] + 0x10) = fitted;
+    display_note(wh, fitted);
+}
+
+// In place of the calls to 1.8.0's display size setter (display, const size *, slot): the setter itself, which also
+// keeps the mode index of the original size, then its slot rewritten with the fitted size.
+static void host_display_set(Cpu *c) {
+    uint64_t display = c->x[0], size = c->x[1], slot = (uint64_t)(int64_t)(int32_t)c->x[2];
+    rt_call(c, rt_main_addr(rt_version()->display_set_fn), 3, display, size, slot);
+    uint64_t *at = (uint64_t *)(uintptr_t)(display + 0x10 + 8 * slot), wh = *at, fitted = display_fit(wh);
+    *at = fitted;
+    display_note(wh, fitted);
 }
 
 // In place of fdiv s0, s0, s1 (recomp/patches-mkw.txt): the camera's aspect, fitted.
@@ -1006,6 +1056,7 @@ static void aspect_set(const RtGame *g) {
         if (!strcmp(g->patch_sets[i].name, "aspect")) g->patch_on[i] = aspect_out != 0;
         if (!strcmp(g->patch_sets[i].name, "vertplus"))
             g->patch_on[i] = aspect_out > 0 && aspect_scale < 1;
+        if (!strcmp(g->patch_sets[i].name, "display")) g->patch_on[i] = aspect_out != 0;   // 1.8.0's table only
     }
     if (aspect_out) rt_log("patches: camera aspect %.3f, x%.3f over 16:9 (MKW_ASPECT %s)", aspect_out, aspect_scale,
                            cfg_value("MKW_ASPECT"));
@@ -1043,6 +1094,13 @@ static void output_size(const RtGame *g) {
         }
     }
     if (!lines && aspect_out && !(at_screen && aspect_scale < 1)) lines = 1440;
+    // With the display set (1.8.0) the picture takes the output's shape itself (display_fit): a tall output gets the
+    // rows of that shape too, or the fitted picture would be shrunk into 16:9's lines. Without a size of its own the
+    // output stays the game's (output_lines at 16:9: 3840x2160), which display_fit fits.
+    int display = 0;
+    for (int i = 0; i < g->npatch_sets; i++)
+        if (!strcmp(g->patch_sets[i].name, "display")) display = g->patch_on[i];
+    output_wh[0] = (uint32_t)(native * 16 / 9), output_wh[1] = (uint32_t)native;
     for (int i = 0; i < g->npatch_sets; i++) {
         if (strcmp(g->patch_sets[i].name, "output")) continue;
         if (lines <= 0 || (off && !strcmp(off, "0"))) {
@@ -1052,11 +1110,12 @@ static void output_size(const RtGame *g) {
         int tall_at_screen = at_screen && aspect_out > 0 && aspect_scale < 1;   // 16:9 at the lines
         uint32_t wide = aspect_out && !tall_at_screen ? ((uint32_t)(lines * aspect_out + 0.5f) + 1) & ~1u : 0;
         uint32_t wh[2] = {wide ? wide : (uint32_t)(lines * 16 / 9), (uint32_t)lines};
-        if (aspect_out > 0 && aspect_scale < 1 && !at_screen) {
+        if (aspect_out > 0 && aspect_scale < 1 && (!at_screen || display)) {
             int w = 0, h = 0;
-            if (!strcmp(res, "original")) gfx_window_shape(&w, &h);
+            if (!strcmp(res, "original") && !at_screen) gfx_window_shape(&w, &h);
             aspect_tall_target(wh, lines, aspect_out, w, h);
         }
+        output_wh[0] = wh[0], output_wh[1] = wh[1];
         memcpy((void *)(uintptr_t)(g->patch_page + OUTPUT_SIZE), wh, sizeof wh);
         g->patch_on[i] = 1;
         rt_log("patches: game output %ux%u instead of %dx%d (MKW_RESOLUTION %s, MKW_ASPECT %s, window lines %d)",
@@ -1129,6 +1188,8 @@ void rt_patch_hosts(void) {
     if (g->npatch_sets) rt_register_host(g->patch_page + UI_ROWS2_HOST, host_ui_rows2);
     if (g->npatch_sets) rt_register_host(g->patch_page + FX_VIEW_HOST, host_fx_view);
     if (g->npatch_sets) rt_register_host(g->patch_page + PANE_MATRIX_HOST, host_pane_matrix);
+    if (g->npatch_sets) rt_register_host(g->patch_page + DISPLAY_SIZE_HOST, host_display_size);
+    if (g->npatch_sets) rt_register_host(g->patch_page + DISPLAY_SET_HOST, host_display_set);
     if (g->npatch_sets) frame_rate_host(g->patch_page);
     if (g->npatch_sets) race_scene_host(g->patch_page);
     if (g->npatch_sets) rt_register_host(g->patch_page + CAMERA_EVENT_HOST, host_camera_event);

@@ -174,6 +174,16 @@ site aspect main 17f9724 97fffcb3 947fddb3     # same
 set vertplus MKW_VERTPLUS_PATCH 0
 site vertplus main 894a4 1e2e0808 94dd9ea3   # fmul s8, s0, s14 -> bl host_camera_fov (patch page + 0xf30); 1.0.0's 45fba4
 
+# The picture's size: 1.8.0 sizes its render targets and the window crop from the display object's requested size at
+# +0x10 (version.c display_store), not from the output set's, so a taller or wider output alone keeps a 16:9 picture
+# that the present stretches. Its only writers take the output's shape (patches.c host_display_size/host_display_set):
+# the store in main+0x372240 (which saves x30), and both calls of the leaf setter main+0xde6060, whose own store cannot
+# take a bl (its ret would return into the hook). On with the aspect set, for any output that is not 16:9.
+set display MKW_DISPLAY_PATCH 0
+site display main 3723b4 f900092c 94d1fad7   # str x12, [x9, #0x10] -> bl host_display_size (patch page + 0xf10)
+site display main 372840 9429ce08 94d1f9b0   # bl main+0xde6060 -> bl host_display_set (patch page + 0xf00)
+site display main de5b58 94000142 94a82cea   # same
+
 # Shadow map: main+0xb72c0 is 1.0.0's main+0x233358, the RenderBuffer creation (the only function using the string
 # "shadow_map_depth"; width and height at [x0+0x68] and [x0+0x88]); its caller main+0xb6e40 is 1.0.0's main+0x22d45c.
 set shadow MKW_SHADOW_PATCH 0
